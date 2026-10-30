@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -7,12 +7,14 @@ using System.Text;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Forms; // Screen, OpenFileDialog
+using System.Windows.Forms; // Screen, OpenFileDialog, NotifyIcon
+using System.Windows.Interop; // HwndSource
 using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Threading;
 using Button = System.Windows.Controls.Button;
 using ComboBox = System.Windows.Controls.ComboBox;
+using CheckBox = System.Windows.Controls.CheckBox;
 using MessageBox = System.Windows.MessageBox;
 using TextBox = System.Windows.Controls.TextBox;
 using Application = System.Windows.Application;
@@ -95,10 +97,16 @@ namespace WorkspaceHubApp
     {
         public string SelectedProfileId;
         public List<Profile> Profiles;
+        public bool EnableGlobalHotkey = true;
+        public bool StartWithWindows = false;
+        public bool MinimizeToTrayOnClose = true;
 
         public AppConfig()
         {
             Profiles = new List<Profile>();
+            EnableGlobalHotkey = true;
+            StartWithWindows = false;
+            MinimizeToTrayOnClose = true;
         }
 
         public static AppConfig CreateDefault()
@@ -156,6 +164,9 @@ namespace WorkspaceHubApp
             var sb = new StringBuilder();
             sb.AppendLine("{");
             sb.AppendLine("  \"SelectedProfileId\": \"" + Escape(config.SelectedProfileId) + "\",");
+            sb.AppendLine("  \"EnableGlobalHotkey\": " + (config.EnableGlobalHotkey ? "true" : "false") + ",");
+            sb.AppendLine("  \"StartWithWindows\": " + (config.StartWithWindows ? "true" : "false") + ",");
+            sb.AppendLine("  \"MinimizeToTrayOnClose\": " + (config.MinimizeToTrayOnClose ? "true" : "false") + ",");
             sb.AppendLine("  \"Profiles\": [");
             for (int i = 0; i < config.Profiles.Count; i++)
             {
@@ -203,6 +214,9 @@ namespace WorkspaceHubApp
             try
             {
                 config.SelectedProfileId = ExtractString(json, "SelectedProfileId");
+                config.EnableGlobalHotkey = ExtractBool(json, "EnableGlobalHotkey", true);
+                config.StartWithWindows = ExtractBool(json, "StartWithWindows", false);
+                config.MinimizeToTrayOnClose = ExtractBool(json, "MinimizeToTrayOnClose", true);
                 int profStart = json.IndexOf("\"Profiles\"");
                 if (profStart >= 0)
                 {
@@ -385,6 +399,19 @@ namespace WorkspaceHubApp
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
 
+        [DllImport("user32.dll")]
+        public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        [DllImport("user32.dll")]
+        public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr hWnd);
+
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
         {
@@ -402,12 +429,22 @@ namespace WorkspaceHubApp
         public const int SW_SHOWNORMAL = 1;
         public const int SW_RESTORE = 9;
         public const int SW_MAXIMIZE = 3;
+        public const int SW_MINIMIZE = 6;
+
+        public const uint WM_CLOSE = 0x0010;
+        public const int WM_HOTKEY = 0x0312;
+        public const uint MOD_ALT = 0x0001;
+        public const uint MOD_CONTROL = 0x0002;
+        public const uint MOD_SHIFT = 0x0004;
+        public const uint MOD_WIN = 0x0008;
+        public const uint MOD_NOREPEAT = 0x4000;
 
         public class OpenWindowInfo
         {
             public IntPtr Handle;
             public string Title;
             public string ProcessName;
+            public string ExePath;
             public uint ProcessId;
             public RECT Rect;
             public int MonitorIndex;
@@ -421,6 +458,8 @@ namespace WorkspaceHubApp
         public static List<OpenWindowInfo> GetOpenWindows()
         {
             var list = new List<OpenWindowInfo>();
+            int currentPid = Process.GetCurrentProcess().Id;
+
             EnumWindows((hWnd, lParam) =>
             {
                 if (IsWindowVisible(hWnd))
@@ -436,8 +475,26 @@ namespace WorkspaceHubApp
                     {
                         uint pid;
                         GetWindowThreadProcessId(hWnd, out pid);
+
+                        // 自プロセスのウィンドウは除外
+                        if ((int)pid == currentPid) return true;
+
                         string procName = "";
-                        try { procName = Process.GetProcessById((int)pid).ProcessName; } catch { }
+                        string exePath = "";
+                        try
+                        {
+                            using (var proc = Process.GetProcessById((int)pid))
+                            {
+                                procName = proc.ProcessName;
+                                try { exePath = proc.MainModule.FileName; } catch { }
+                            }
+                        }
+                        catch { }
+
+                        if (string.IsNullOrEmpty(exePath) && !string.IsNullOrEmpty(procName))
+                        {
+                            exePath = procName + ".exe";
+                        }
 
                         int monIdx = GetMonitorIndexForRect(rect);
                         list.Add(new OpenWindowInfo
@@ -445,6 +502,7 @@ namespace WorkspaceHubApp
                             Handle = hWnd,
                             Title = title,
                             ProcessName = procName,
+                            ExePath = exePath,
                             ProcessId = pid,
                             Rect = rect,
                             MonitorIndex = monIdx
@@ -1132,12 +1190,26 @@ namespace WorkspaceHubApp
         private TextBlock txtMonitorInfo;
         private Button btnLaunchAll;
 
+        private const int HOTKEY_ID_LAUNCH = 9001;
+        private const int HOTKEY_ID_CLEANUP = 9002;
+        private HwndSource hwndSource;
+        private System.Windows.Forms.NotifyIcon notifyIcon;
+        private bool isExiting = false;
+        private CheckBox chkStartWithWindows;
+        private CheckBox chkGlobalHotkey;
+        private const string RUN_REG_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string APP_NAME = "WorkspaceHub";
+
         public MainWindow()
         {
             configPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "workspace_config.json");
             LoadConfig();
 
+            // レジストリ状態と同期
+            config.StartWithWindows = CheckStartupRegistry();
+
             InitUI();
+            InitNotifyIcon();
             RefreshProfilesCombo();
             RefreshToolCards();
         }
@@ -1205,10 +1277,11 @@ namespace WorkspaceHubApp
             FontFamily = new FontFamily("Yu Gothic UI, Segoe UI, Meiryo");
 
             var rootGrid = new Grid();
-            rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Header
-            rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Hero Button & Action Bar
-            rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // Tool List
-            rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Footer / Status
+            rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 0: Header
+            rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 1: Hero Button & Action Bar
+            rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // 2: Tool List
+            rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 3: Settings Bar
+            rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 4: Footer / Status
 
             // --- 1. Header ---
             var headerBorder = new Border
@@ -1272,6 +1345,11 @@ namespace WorkspaceHubApp
             };
             cbProfiles.SelectionChanged += CbProfiles_SelectionChanged;
 
+            var btnSnapshotProf = CreateStyledButton("📸 画面から新規作成", "#0EA5E9", 145, 34);
+            btnSnapshotProf.ToolTip = "現在デスクトップで開いているウィンドウの配置をそのままプロファイルとして保存します";
+            btnSnapshotProf.Click += BtnSnapshotProfile_Click;
+            btnSnapshotProf.Margin = new Thickness(0, 0, 6, 0);
+
             var btnNewProf = CreateStyledButton("＋ 新規", "#3B82F6", 65, 34);
             btnNewProf.Click += BtnNewProf_Click;
             btnNewProf.Margin = new Thickness(0, 0, 6, 0);
@@ -1281,6 +1359,7 @@ namespace WorkspaceHubApp
 
             profilePanel.Children.Add(lblProf);
             profilePanel.Children.Add(cbProfiles);
+            profilePanel.Children.Add(btnSnapshotProf);
             profilePanel.Children.Add(btnNewProf);
             profilePanel.Children.Add(btnDelProf);
             Grid.SetColumn(profilePanel, 1);
@@ -1344,8 +1423,20 @@ namespace WorkspaceHubApp
             btnArrangeOnly.Click += BtnArrangeOnly_Click;
             btnArrangeOnly.Margin = new Thickness(0, 0, 10, 0);
 
+            var btnToggleMinimize = CreateStyledButton("🧹 最小化/復元", "#475569", 125, 34);
+            btnToggleMinimize.ToolTip = "登録ツールのウィンドウを一括最小化、または元の位置に復元します (Ctrl+Alt+H)";
+            btnToggleMinimize.Click += (s, e) => ToggleMinimizeRestore();
+            btnToggleMinimize.Margin = new Thickness(0, 0, 10, 0);
+
+            var btnCloseAll = CreateStyledButton("❌ 一括終了", "#991B1B", 100, 34);
+            btnCloseAll.ToolTip = "登録ツールのウィンドウを一括終了します";
+            btnCloseAll.Click += (s, e) => CloseAllTools();
+            btnCloseAll.Margin = new Thickness(0, 0, 10, 0);
+
             leftActions.Children.Add(btnAddTool);
             leftActions.Children.Add(btnArrangeOnly);
+            leftActions.Children.Add(btnToggleMinimize);
+            leftActions.Children.Add(btnCloseAll);
             Grid.SetColumn(leftActions, 0);
 
             var btnDesktopShortcut = CreateStyledButton("📌 デスクトップにショートカット作成", "#8B5CF6", 240, 34);
@@ -1371,7 +1462,47 @@ namespace WorkspaceHubApp
             Grid.SetRow(scrollViewer, 2);
             rootGrid.Children.Add(scrollViewer);
 
-            // --- 4. Footer & Monitor Info ---
+            // --- 4. Settings Bar ---
+            var settingsBorder = new Border
+            {
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0F172A")),
+                BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1E293B")),
+                BorderThickness = new Thickness(0, 1, 0, 0),
+                Padding = new Thickness(24, 7, 24, 7)
+            };
+            var settingsPanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
+
+            chkGlobalHotkey = new CheckBox
+            {
+                Content = "⌨️ ホットキー有効 (Ctrl+Alt+W: 一括起動/整列, Ctrl+Alt+H: 一括最小化/復元)",
+                IsChecked = config.EnableGlobalHotkey,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#94A3B8")),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 24, 0),
+                FontSize = 12
+            };
+            chkGlobalHotkey.Checked += (s, e) => { config.EnableGlobalHotkey = true; SaveConfig(); UpdateHotkeys(); };
+            chkGlobalHotkey.Unchecked += (s, e) => { config.EnableGlobalHotkey = false; SaveConfig(); UpdateHotkeys(); };
+
+            chkStartWithWindows = new CheckBox
+            {
+                Content = "🚀 PC起動時に常駐 (タスクトレイ)",
+                IsChecked = config.StartWithWindows,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#94A3B8")),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 24, 0),
+                FontSize = 12
+            };
+            chkStartWithWindows.Checked += (s, e) => { config.StartWithWindows = true; SetStartupRegistry(true); SaveConfig(); };
+            chkStartWithWindows.Unchecked += (s, e) => { config.StartWithWindows = false; SetStartupRegistry(false); SaveConfig(); };
+
+            settingsPanel.Children.Add(chkGlobalHotkey);
+            settingsPanel.Children.Add(chkStartWithWindows);
+            settingsBorder.Child = settingsPanel;
+            Grid.SetRow(settingsBorder, 3);
+            rootGrid.Children.Add(settingsBorder);
+
+            // --- 5. Footer & Monitor Info ---
             var footerBorder = new Border
             {
                 Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0B0F19")),
@@ -1411,7 +1542,7 @@ namespace WorkspaceHubApp
             footerGrid.Children.Add(txtStatus);
             footerGrid.Children.Add(txtMonitorInfo);
             footerBorder.Child = footerGrid;
-            Grid.SetRow(footerBorder, 3);
+            Grid.SetRow(footerBorder, 4);
             rootGrid.Children.Add(footerBorder);
 
             this.Content = rootGrid;
@@ -1931,6 +2062,336 @@ namespace WorkspaceHubApp
                 MessageBox.Show("ショートカット作成に失敗しました: " + ex.Message, "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
+
+        // ==========================================
+        // 項目1: グローバルホットキー & タスクトレイ & スタートアップ
+        // ==========================================
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            hwndSource = PresentationSource.FromVisual(this) as HwndSource;
+            if (hwndSource != null)
+            {
+                hwndSource.AddHook(HwndHook);
+                UpdateHotkeys();
+            }
+        }
+
+        private void UpdateHotkeys()
+        {
+            if (hwndSource == null) return;
+            IntPtr handle = hwndSource.Handle;
+            WindowEngine.UnregisterHotKey(handle, HOTKEY_ID_LAUNCH);
+            WindowEngine.UnregisterHotKey(handle, HOTKEY_ID_CLEANUP);
+
+            if (config.EnableGlobalHotkey)
+            {
+                // Ctrl + Alt + W : 一括起動＆整列
+                WindowEngine.RegisterHotKey(handle, HOTKEY_ID_LAUNCH, WindowEngine.MOD_CONTROL | WindowEngine.MOD_ALT | WindowEngine.MOD_NOREPEAT, (uint)Keys.W);
+                // Ctrl + Alt + H : 一括最小化/復元
+                WindowEngine.RegisterHotKey(handle, HOTKEY_ID_CLEANUP, WindowEngine.MOD_CONTROL | WindowEngine.MOD_ALT | WindowEngine.MOD_NOREPEAT, (uint)Keys.H);
+            }
+        }
+
+        private IntPtr HwndHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WindowEngine.WM_HOTKEY)
+            {
+                int id = wParam.ToInt32();
+                if (id == HOTKEY_ID_LAUNCH)
+                {
+                    handled = true;
+                    ExecuteLaunchAll();
+                }
+                else if (id == HOTKEY_ID_CLEANUP)
+                {
+                    handled = true;
+                    ToggleMinimizeRestore();
+                }
+            }
+            return IntPtr.Zero;
+        }
+
+        private bool CheckStartupRegistry()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RUN_REG_KEY, false))
+                {
+                    if (key != null)
+                    {
+                        var val = key.GetValue(APP_NAME) as string;
+                        return !string.IsNullOrEmpty(val);
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private void SetStartupRegistry(bool enable)
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RUN_REG_KEY, true))
+                {
+                    if (key != null)
+                    {
+                        if (enable)
+                        {
+                            string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                            key.SetValue(APP_NAME, "\"" + exePath + "\" --tray");
+                        }
+                        else
+                        {
+                            key.DeleteValue(APP_NAME, false);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("スタートアップ設定の変更に失敗しました: " + ex.Message, "エラー", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        private void InitNotifyIcon()
+        {
+            notifyIcon = new System.Windows.Forms.NotifyIcon();
+            string dir = AppDomain.CurrentDomain.BaseDirectory;
+            string icoPath = System.IO.Path.Combine(dir, "workspace.ico");
+            if (File.Exists(icoPath))
+            {
+                try { notifyIcon.Icon = new System.Drawing.Icon(icoPath); }
+                catch { notifyIcon.Icon = System.Drawing.SystemIcons.Application; }
+            }
+            else
+            {
+                notifyIcon.Icon = System.Drawing.SystemIcons.Application;
+            }
+            notifyIcon.Text = "⚡ Workspace Hub";
+            notifyIcon.Visible = true;
+
+            notifyIcon.DoubleClick += (s, e) =>
+            {
+                ShowAndActivate();
+            };
+
+            BuildNotifyContextMenu();
+        }
+
+        private void BuildNotifyContextMenu()
+        {
+            var menu = new System.Windows.Forms.ContextMenuStrip();
+
+            var profile = GetCurrentProfile();
+            var itemLaunch = new System.Windows.Forms.ToolStripMenuItem("⚡ 一括起動・整列 (" + (profile != null ? profile.Name : "") + ")");
+            itemLaunch.Font = new System.Drawing.Font(itemLaunch.Font, System.Drawing.FontStyle.Bold);
+            itemLaunch.Click += (s, e) => ExecuteLaunchAll();
+            menu.Items.Add(itemLaunch);
+
+            // プロファイル切り替えサブメニュー
+            var profMenu = new System.Windows.Forms.ToolStripMenuItem("📁 プロファイル選択");
+            foreach (var p in config.Profiles)
+            {
+                var pItem = new System.Windows.Forms.ToolStripMenuItem(p.Name);
+                pItem.Checked = (p.Id == config.SelectedProfileId);
+                string pid = p.Id;
+                pItem.Click += (s, e) =>
+                {
+                    config.SelectedProfileId = pid;
+                    SaveConfig();
+                    RefreshProfilesCombo();
+                    RefreshToolCards();
+                    BuildNotifyContextMenu();
+                };
+                profMenu.DropDownItems.Add(pItem);
+            }
+            menu.Items.Add(profMenu);
+
+            menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+
+            var itemMin = new System.Windows.Forms.ToolStripMenuItem("🧹 一括最小化 / 復元 (Ctrl+Alt+H)");
+            itemMin.Click += (s, e) => ToggleMinimizeRestore();
+            menu.Items.Add(itemMin);
+
+            var itemClose = new System.Windows.Forms.ToolStripMenuItem("❌ ツールを一括終了");
+            itemClose.Click += (s, e) => CloseAllTools();
+            menu.Items.Add(itemClose);
+
+            menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+
+            var itemShow = new System.Windows.Forms.ToolStripMenuItem("🖥️ ホーム画面を表示");
+            itemShow.Click += (s, e) => ShowAndActivate();
+            menu.Items.Add(itemShow);
+
+            var itemExit = new System.Windows.Forms.ToolStripMenuItem("🚪 アプリを完全終了");
+            itemExit.Click += (s, e) =>
+            {
+                isExiting = true;
+                this.Close();
+            };
+            menu.Items.Add(itemExit);
+
+            notifyIcon.ContextMenuStrip = menu;
+        }
+
+        public void ShowAndActivate()
+        {
+            this.Show();
+            if (this.WindowState == WindowState.Minimized)
+            {
+                this.WindowState = WindowState.Normal;
+            }
+            this.Activate();
+        }
+
+        protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+        {
+            if (!isExiting && config.MinimizeToTrayOnClose)
+            {
+                e.Cancel = true;
+                this.Hide();
+                try
+                {
+                    notifyIcon.ShowBalloonTip(2000, "⚡ Workspace Hub", "バックグラウンドで動作中です。タスクトレイからいつでも開けます。", System.Windows.Forms.ToolTipIcon.Info);
+                }
+                catch { }
+                return;
+            }
+
+            if (hwndSource != null)
+            {
+                WindowEngine.UnregisterHotKey(hwndSource.Handle, HOTKEY_ID_LAUNCH);
+                WindowEngine.UnregisterHotKey(hwndSource.Handle, HOTKEY_ID_CLEANUP);
+            }
+            if (notifyIcon != null)
+            {
+                notifyIcon.Visible = false;
+                notifyIcon.Dispose();
+            }
+            base.OnClosing(e);
+            try { System.Windows.Application.Current.Shutdown(); } catch { }
+        }
+
+        // ==========================================
+        // 項目2: 片付け・切り替えをスマートにする機能
+        // ==========================================
+        private void ToggleMinimizeRestore()
+        {
+            var profile = GetCurrentProfile();
+            var items = profile.Items.FindAll(x => x.Enabled);
+            if (items.Count == 0) return;
+
+            var windows = WindowEngine.GetOpenWindows();
+            var matchedWindows = new List<Tuple<WindowEngine.OpenWindowInfo, ToolItem>>();
+
+            foreach (var item in items)
+            {
+                string exeName = "";
+                try { exeName = System.IO.Path.GetFileNameWithoutExtension(item.Path).ToLowerInvariant(); } catch { }
+                if (string.IsNullOrEmpty(exeName)) continue;
+
+                foreach (var w in windows)
+                {
+                    if (w.ProcessName.ToLowerInvariant().Contains(exeName))
+                    {
+                        matchedWindows.Add(new Tuple<WindowEngine.OpenWindowInfo, ToolItem>(w, item));
+                        break;
+                    }
+                }
+            }
+
+            if (matchedWindows.Count == 0)
+            {
+                txtStatus.Text = "最小化/復元対象の実行中ツールが見つかりませんでした。";
+                return;
+            }
+
+            // 1つでも通常状態のウィンドウがあれば一括最小化、すべて最小化されていれば復元
+            bool anyVisible = false;
+            foreach (var m in matchedWindows)
+            {
+                if (!WindowEngine.IsIconic(m.Item1.Handle))
+                {
+                    anyVisible = true;
+                    break;
+                }
+            }
+
+            if (anyVisible)
+            {
+                foreach (var m in matchedWindows)
+                {
+                    WindowEngine.ShowWindow(m.Item1.Handle, WindowEngine.SW_MINIMIZE);
+                }
+                txtStatus.Text = "🧹 ツールを一括最小化しました (" + matchedWindows.Count + " 件)";
+            }
+            else
+            {
+                foreach (var m in matchedWindows)
+                {
+                    WindowEngine.ApplyLayout(m.Item1.Handle, m.Item2);
+                }
+                txtStatus.Text = "✨ ツールを一括復元・整列しました (" + matchedWindows.Count + " 件)";
+            }
+        }
+
+        private void CloseAllTools()
+        {
+            var profile = GetCurrentProfile();
+            var items = profile.Items.FindAll(x => x.Enabled);
+            if (items.Count == 0) return;
+
+            var res = MessageBox.Show(
+                "「" + profile.Name + "」に登録されている起動中のツールを一括終了しますか？\r\n（保存していないデータがある場合は各ツールの確認ダイアログが表示されます）",
+                "一括終了の確認",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+
+            if (res != MessageBoxResult.Yes) return;
+
+            var windows = WindowEngine.GetOpenWindows();
+            int closedCount = 0;
+
+            foreach (var item in items)
+            {
+                string exeName = "";
+                try { exeName = System.IO.Path.GetFileNameWithoutExtension(item.Path).ToLowerInvariant(); } catch { }
+                if (string.IsNullOrEmpty(exeName)) continue;
+
+                foreach (var w in windows)
+                {
+                    if (w.ProcessName.ToLowerInvariant().Contains(exeName))
+                    {
+                        WindowEngine.PostMessage(w.Handle, WindowEngine.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                        closedCount++;
+                        break;
+                    }
+                }
+            }
+
+            txtStatus.Text = "❌ ツールに終了リクエストを送信しました (" + closedCount + " 件)";
+        }
+
+        // ==========================================
+        // 項目3: 現在の画面から丸ごとプロファイル保存
+        // ==========================================
+        private void BtnSnapshotProfile_Click(object sender, RoutedEventArgs e)
+        {
+            var modal = new SnapshotModal();
+            modal.Owner = this;
+            if (modal.ShowDialog() == true && modal.CreatedProfile != null)
+            {
+                config.Profiles.Add(modal.CreatedProfile);
+                config.SelectedProfileId = modal.CreatedProfile.Id;
+                SaveConfig();
+                RefreshProfilesCombo();
+                RefreshToolCards();
+                BuildNotifyContextMenu();
+                txtStatus.Text = "📸 「" + modal.CreatedProfile.Name + "」を作成しました！(登録ツール: " + modal.CreatedProfile.Items.Count + " 件)";
+            }
+        }
     }
 
     // ==========================================
@@ -2404,6 +2865,240 @@ namespace WorkspaceHubApp
     }
 
     // ==========================================
+    // 画面スナップショットから新規プロファイル作成モーダル
+    // ==========================================
+    public class SnapshotModal : Window
+    {
+        public Profile CreatedProfile { get; private set; }
+        private TextBox txtProfileName;
+        private List<CheckBox> checkBoxes = new List<CheckBox>();
+        private List<WindowEngine.OpenWindowInfo> windowList;
+
+        public SnapshotModal()
+        {
+            this.Title = "📸 現在の画面配置からプロファイルを新規作成";
+            this.Width = 720;
+            this.Height = 560;
+            this.MinWidth = 600;
+            this.MinHeight = 450;
+            this.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            this.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0F172A"));
+            FontFamily = new FontFamily("Yu Gothic UI, Segoe UI, Meiryo");
+
+            var mainGrid = new Grid { Margin = new Thickness(20) };
+            mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Header & Profile Name
+            mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Controls (Select all etc)
+            mainGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // List
+            mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Action Buttons
+
+            // 1. Header & Profile Name
+            var headerPanel = new StackPanel { Margin = new Thickness(0, 0, 0, 14) };
+            headerPanel.Children.Add(new TextBlock
+            {
+                Text = "📸 デスクトップ上の開いているウィンドウから自動生成",
+                FontSize = 16,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brushes.White,
+                Margin = new Thickness(0, 0, 0, 4)
+            });
+            headerPanel.Children.Add(new TextBlock
+            {
+                Text = "検出されたウィンドウの位置・サイズをそのままカスタム座標として登録します。\r\n登録したいアプリにチェックを入れて「作成」を押してください。",
+                FontSize = 12,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#94A3B8")),
+                Margin = new Thickness(0, 0, 0, 12)
+            });
+
+            var nameRow = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
+            nameRow.Children.Add(new TextBlock
+            {
+                Text = "プロファイル名:",
+                Foreground = Brushes.White,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 10, 0),
+                FontWeight = FontWeights.SemiBold
+            });
+            txtProfileName = new TextBox
+            {
+                Text = "作業セット " + DateTime.Now.ToString("yyyy-MM-dd HH:mm"),
+                Width = 320,
+                Height = 32,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                FontSize = 13
+            };
+            nameRow.Children.Add(txtProfileName);
+            headerPanel.Children.Add(nameRow);
+            Grid.SetRow(headerPanel, 0);
+            mainGrid.Children.Add(headerPanel);
+
+            // 2. Select All / Deselect All Controls
+            var ctrlRow = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 8) };
+            var btnSelectAll = new Button { Content = "すべて選択", Width = 90, Height = 26, Margin = new Thickness(0, 0, 8, 0) };
+            btnSelectAll.Click += (s, e) => { foreach (var cb in checkBoxes) cb.IsChecked = true; };
+            var btnDeselectAll = new Button { Content = "すべて解除", Width = 90, Height = 26 };
+            btnDeselectAll.Click += (s, e) => { foreach (var cb in checkBoxes) cb.IsChecked = false; };
+            ctrlRow.Children.Add(btnSelectAll);
+            ctrlRow.Children.Add(btnDeselectAll);
+            Grid.SetRow(ctrlRow, 1);
+            mainGrid.Children.Add(ctrlRow);
+
+            // 3. Window List
+            windowList = WindowEngine.GetOpenWindows();
+            var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+            var listPanel = new StackPanel();
+
+            if (windowList.Count == 0)
+            {
+                listPanel.Children.Add(new TextBlock
+                {
+                    Text = "検出可能なウィンドウが見つかりませんでした。\r\nアプリを起動して画面上に配置してから再度お試しください。",
+                    Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EF4444")),
+                    Margin = new Thickness(10)
+                });
+            }
+            else
+            {
+                for (int i = 0; i < windowList.Count; i++)
+                {
+                    var win = windowList[i];
+                    var itemBorder = new Border
+                    {
+                        Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1E293B")),
+                        BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#334155")),
+                        BorderThickness = new Thickness(1),
+                        CornerRadius = new CornerRadius(6),
+                        Margin = new Thickness(0, 0, 0, 6),
+                        Padding = new Thickness(12, 10, 12, 10)
+                    };
+
+                    var row = new Grid();
+                    row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+                    var chk = new CheckBox
+                    {
+                        IsChecked = true,
+                        VerticalAlignment = VerticalAlignment.Center,
+                        Margin = new Thickness(0, 0, 12, 0)
+                    };
+                    checkBoxes.Add(chk);
+                    Grid.SetColumn(chk, 0);
+
+                    var infoPanel = new StackPanel();
+                    var titleText = new TextBlock
+                    {
+                        Text = string.IsNullOrEmpty(win.Title) ? win.ProcessName : win.Title,
+                        FontWeight = FontWeights.Bold,
+                        Foreground = Brushes.White,
+                        FontSize = 13,
+                        TextTrimming = TextTrimming.CharacterEllipsis
+                    };
+                    string monStr = win.MonitorIndex >= 0 ? string.Format("モニター {0}", win.MonitorIndex + 1) : "メインモニター";
+                    var detailText = new TextBlock
+                    {
+                        Text = string.Format("プロセス: {0} | 座標: ({1}, {2}) | サイズ: {3}x{4} | 配置先: {5}",
+                            win.ProcessName, win.Rect.Left, win.Rect.Top, win.Rect.Width, win.Rect.Height, monStr),
+                        Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#94A3B8")),
+                        FontSize = 11,
+                        Margin = new Thickness(0, 3, 0, 0)
+                    };
+                    infoPanel.Children.Add(titleText);
+                    infoPanel.Children.Add(detailText);
+                    Grid.SetColumn(infoPanel, 1);
+
+                    row.Children.Add(chk);
+                    row.Children.Add(infoPanel);
+                    itemBorder.Child = row;
+                    listPanel.Children.Add(itemBorder);
+                }
+            }
+
+            scroll.Content = listPanel;
+            Grid.SetRow(scroll, 2);
+            mainGrid.Children.Add(scroll);
+
+            // 4. Action Buttons
+            var actionPanel = new StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 16, 0, 0)
+            };
+
+            var btnCancel = new Button
+            {
+                Content = "キャンセル",
+                Width = 90,
+                Height = 34,
+                Margin = new Thickness(0, 0, 10, 0)
+            };
+            btnCancel.Click += (s, e) => { this.DialogResult = false; };
+
+            var btnCreate = new Button
+            {
+                Content = "✅ この画面配置でプロファイル作成",
+                Width = 240,
+                Height = 34,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0EA5E9")),
+                Foreground = Brushes.White,
+                FontWeight = FontWeights.Bold
+            };
+            btnCreate.Click += (s, e) =>
+            {
+                string profName = txtProfileName.Text.Trim();
+                if (string.IsNullOrEmpty(profName))
+                {
+                    MessageBox.Show("プロファイル名を入力してください。", "入力確認", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                var newProfile = new Profile { Name = profName };
+                int selectedCount = 0;
+
+                for (int i = 0; i < windowList.Count; i++)
+                {
+                    if (checkBoxes[i].IsChecked == true)
+                    {
+                        var win = windowList[i];
+                        selectedCount++;
+
+                        var item = new ToolItem
+                        {
+                            Name = string.IsNullOrEmpty(win.Title) ? win.ProcessName : win.Title,
+                            Path = !string.IsNullOrEmpty(win.ExePath) ? win.ExePath : win.ProcessName + ".exe",
+                            MonitorIndex = win.MonitorIndex,
+                            LayoutType = "Custom",
+                            CustomX = win.Rect.Left,
+                            CustomY = win.Rect.Top,
+                            CustomWidth = win.Rect.Width,
+                            CustomHeight = win.Rect.Height,
+                            DelayMs = 300,
+                            Enabled = true
+                        };
+                        newProfile.Items.Add(item);
+                    }
+                }
+
+                if (selectedCount == 0)
+                {
+                    MessageBox.Show("少なくとも1つのウィンドウにチェックを入れてください。", "確認", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                CreatedProfile = newProfile;
+                this.DialogResult = true;
+            };
+
+            actionPanel.Children.Add(btnCancel);
+            actionPanel.Children.Add(btnCreate);
+            Grid.SetRow(actionPanel, 3);
+            mainGrid.Children.Add(actionPanel);
+
+            this.Content = mainGrid;
+        }
+    }
+
+    // ==========================================
     // エントリーポイント
     // ==========================================
     public static class Program
@@ -2411,14 +3106,19 @@ namespace WorkspaceHubApp
         [STAThread]
         public static void Main(string[] args)
         {
-            // コマンドライン引数: --launch-all (GUIを表示せずに直接一括起動)
+            // コマンドライン引数: --launch-all (GUIを表示せずに直接一括起動) / --tray (トレイ常駐)
             bool silentLaunch = false;
+            bool startInTray = false;
             foreach (var arg in args)
             {
                 if (arg.Equals("--launch-all", StringComparison.OrdinalIgnoreCase))
                 {
                     silentLaunch = true;
                     break;
+                }
+                if (arg.Equals("--tray", StringComparison.OrdinalIgnoreCase))
+                {
+                    startInTray = true;
                 }
             }
 
@@ -2461,13 +3161,18 @@ namespace WorkspaceHubApp
             }
 
             var app = new Application();
+            app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             app.DispatcherUnhandledException += (s, e) =>
             {
                 MessageBox.Show("エラーが発生しました: " + e.Exception.Message, "Workspace Hub エラー", MessageBoxButton.OK, MessageBoxImage.Error);
                 e.Handled = true;
             };
             var mainWin = new MainWindow();
-            app.Run(mainWin);
+            if (!startInTray)
+            {
+                mainWin.Show();
+            }
+            app.Run();
         }
     }
 }
