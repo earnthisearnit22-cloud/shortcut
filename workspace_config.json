@@ -1,0 +1,173 @@
+{
+  "SelectedProfileId": "prof-dev",
+  "Profiles": [
+    {
+      "Id": "prof-dev",
+      "Name": "💻 開発・作業",
+      "Items": [
+        {
+          "Id": "item-browser",
+          "Name": "Google 検索 (ブラウザ)",
+          "Path": "https://www.google.com",
+          "Arguments": "",
+          "MonitorIndex": -1,
+          "LayoutType": "BottomRight",
+          "CustomX": 960,
+          "CustomY": 516,
+          "CustomWidth": 960,
+          "CustomHeight": 516,
+          "DelayMs": 300,
+          "Enabled": false,
+          "BrowserMode": "NewWindow"
+        },
+        {
+          "Id": "69f34eab674f46dfb2cb75712aa0775d",
+          "Name": "グラブル",
+          "Path": "https://game.granbluefantasy.jp/#mypage",
+          "Arguments": "",
+          "MonitorIndex": 0,
+          "LayoutType": "Custom",
+          "CustomX": -1988,
+          "CustomY": -1071,
+          "CustomWidth": 706,
+          "CustomHeight": 1440,
+          "DelayMs": 500,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        },
+        {
+          "Id": "454dee58ad944a6ab3ae75b0affa435e",
+          "Name": "YouTube",
+          "Path": "https://www.youtube.com/",
+          "Arguments": "",
+          "MonitorIndex": 1,
+          "LayoutType": "Maximize",
+          "CustomX": 0,
+          "CustomY": 0,
+          "CustomWidth": 800,
+          "CustomHeight": 600,
+          "DelayMs": 500,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        },
+        {
+          "Id": "c70062965e7b43c1b116727cc7829924",
+          "Name": "Discord",
+          "Path": "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Discord.lnk",
+          "Arguments": "",
+          "MonitorIndex": 0,
+          "LayoutType": "Custom",
+          "CustomX": -3840,
+          "CustomY": -1071,
+          "CustomWidth": 907,
+          "CustomHeight": 1440,
+          "DelayMs": 300,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        },
+        {
+          "Id": "70cb82a1c14e42a19e5d137e9da1113c",
+          "Name": "音量ミキサー",
+          "Path": "ms-settings:apps-volume",
+          "Arguments": "",
+          "MonitorIndex": 0,
+          "LayoutType": "Custom",
+          "CustomX": -3457,
+          "CustomY": -767,
+          "CustomWidth": 1324,
+          "CustomHeight": 937,
+          "DelayMs": 300,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        }
+      ]
+    },
+    {
+      "Id": "prof-research",
+      "Name": "📝 リサーチ・調査",
+      "Items": [
+        {
+          "Id": "item-res-browser",
+          "Name": "Wikipedia / 情報収集",
+          "Path": "https://ja.wikipedia.org",
+          "Arguments": "",
+          "MonitorIndex": -1,
+          "LayoutType": "LeftHalf",
+          "CustomX": 0,
+          "CustomY": 0,
+          "CustomWidth": 960,
+          "CustomHeight": 1032,
+          "DelayMs": 500,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        },
+        {
+          "Id": "item-res-memo",
+          "Name": "調査用メモ帳",
+          "Path": "notepad.exe",
+          "Arguments": "",
+          "MonitorIndex": -1,
+          "LayoutType": "RightHalf",
+          "CustomX": 960,
+          "CustomY": 0,
+          "CustomWidth": 960,
+          "CustomHeight": 1032,
+          "DelayMs": 200,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        }
+      ]
+    },
+    {
+      "Id": "prof-standard",
+      "Name": "🌟 標準アプリ（全環境動作デモ）",
+      "Items": [
+        {
+          "Id": "item-std-notepad",
+          "Name": "メモ帳",
+          "Path": "notepad.exe",
+          "Arguments": "",
+          "MonitorIndex": -1,
+          "LayoutType": "LeftHalf",
+          "CustomX": 0,
+          "CustomY": 0,
+          "CustomWidth": 960,
+          "CustomHeight": 1040,
+          "DelayMs": 200,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        },
+        {
+          "Id": "item-std-browser",
+          "Name": "Google (ブラウザ)",
+          "Path": "https://www.google.com",
+          "Arguments": "",
+          "MonitorIndex": -1,
+          "LayoutType": "TopRight",
+          "CustomX": 960,
+          "CustomY": 0,
+          "CustomWidth": 960,
+          "CustomHeight": 520,
+          "DelayMs": 400,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        },
+        {
+          "Id": "item-std-calc",
+          "Name": "電卓",
+          "Path": "calc.exe",
+          "Arguments": "",
+          "MonitorIndex": -1,
+          "LayoutType": "BottomRight",
+          "CustomX": 960,
+          "CustomY": 520,
+          "CustomWidth": 960,
+          "CustomHeight": 520,
+          "DelayMs": 200,
+          "Enabled": true,
+          "BrowserMode": "NewWindow"
+        }
+      ]
+    }
+  ]
+}
