@@ -40,6 +40,8 @@ namespace WorkspaceHubApp
         public int DelayMs;
         public bool Enabled;
         public string BrowserMode; // NewWindow, App, Tab
+        [NonSerialized]
+        public IntPtr LastHwnd = IntPtr.Zero;
 
         public ToolItem()
         {
@@ -412,6 +414,10 @@ namespace WorkspaceHubApp
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool IsIconic(IntPtr hWnd);
 
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindow(IntPtr hWnd);
+
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
         {
@@ -433,6 +439,9 @@ namespace WorkspaceHubApp
 
         public const uint WM_CLOSE = 0x0010;
         public const int WM_HOTKEY = 0x0312;
+        public const uint WM_SYSCOMMAND = 0x0112;
+        public const int SC_MINIMIZE = 0xF020;
+        public const int SC_RESTORE = 0xF120;
         public const uint MOD_ALT = 0x0001;
         public const uint MOD_CONTROL = 0x0002;
         public const uint MOD_SHIFT = 0x0004;
@@ -1168,11 +1177,112 @@ namespace WorkspaceHubApp
 
             if (foundHwnd != IntPtr.Zero)
             {
+                item.LastHwnd = foundHwnd;
                 usedHwnds.Add(foundHwnd);
                 ApplyLayout(foundHwnd, item);
             }
 
             return foundHwnd;
+        }
+
+        public static List<IntPtr> FindWindowsForTool(ToolItem item)
+        {
+            var result = new List<IntPtr>();
+            if (item == null || string.IsNullOrWhiteSpace(item.Path)) return result;
+
+            // 1. 起動時に記憶した HWND が有効なら即追加
+            if (item.LastHwnd != IntPtr.Zero && IsWindow(item.LastHwnd))
+            {
+                result.Add(item.LastHwnd);
+            }
+
+            string pathTrim = item.Path.Trim();
+            bool isBrowser = IsBrowserTarget(pathTrim);
+            bool isSettings = pathTrim.StartsWith("ms-settings:", StringComparison.OrdinalIgnoreCase);
+
+            string targetProcName = "";
+            if (isSettings)
+            {
+                targetProcName = "systemsettings";
+            }
+            else if (!isBrowser)
+            {
+                string extra;
+                string resolved = ResolvePath(pathTrim, out extra);
+                try { targetProcName = System.IO.Path.GetFileNameWithoutExtension(resolved).ToLowerInvariant(); } catch { }
+                if (string.IsNullOrEmpty(targetProcName))
+                {
+                    try { targetProcName = System.IO.Path.GetFileNameWithoutExtension(pathTrim).ToLowerInvariant(); } catch { }
+                }
+            }
+
+            int currentPid = Process.GetCurrentProcess().Id;
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindow(hWnd)) return true;
+                if (result.Contains(hWnd)) return true; // 既に追加済み
+
+                // 可視または最小化状態のウィンドウを対象にする（最小化中も絶対に漏らさない）
+                bool visible = IsWindowVisible(hWnd);
+                bool iconic = IsIconic(hWnd);
+                if (!visible && !iconic) return true;
+
+                var sb = new StringBuilder(256);
+                GetWindowText(hWnd, sb, 256);
+                string title = sb.ToString().Trim();
+                if (string.IsNullOrEmpty(title) || title == "Program Manager") return true;
+
+                uint pid;
+                GetWindowThreadProcessId(hWnd, out pid);
+                if ((int)pid == currentPid) return true;
+
+                string procName = "";
+                try { procName = Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant(); } catch { }
+
+                if (isBrowser)
+                {
+                    bool isBrowserProc = procName.Contains("chrome") || procName.Contains("msedge") || procName.Contains("firefox") || procName.Contains("brave") || procName.Contains("opera");
+                    if (isBrowserProc)
+                    {
+                        // 1. ツール名（例: "グラブル", "YouTube", "Google"）がウィンドウタイトルに含まれるか
+                        if (!string.IsNullOrEmpty(item.Name) && title.IndexOf(item.Name, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            result.Add(hWnd);
+                        }
+                        // 2. URLのホスト名（例: "granbluefantasy", "youtube", "google"）が含まれるか
+                        else if (!string.IsNullOrEmpty(pathTrim))
+                        {
+                            try
+                            {
+                                string urlClean = pathTrim;
+                                if (!urlClean.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !urlClean.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    urlClean = "https://" + urlClean;
+                                }
+                                var uri = new Uri(urlClean);
+                                string host = uri.Host.Replace("www.", "").Split('.')[0];
+                                if (!string.IsNullOrEmpty(host) && host.Length >= 3 && title.IndexOf(host, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    result.Add(hWnd);
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(targetProcName) && procName.Contains(targetProcName))
+                    {
+                        result.Add(hWnd);
+                    }
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            return result;
         }
     }
 
@@ -1987,18 +2097,19 @@ namespace WorkspaceHubApp
         {
             var profile = GetCurrentProfile();
             var items = profile.Items.FindAll(x => x.Enabled);
-            var windows = WindowEngine.GetOpenWindows();
-
             int matched = 0;
+            var usedHwnds = new HashSet<IntPtr>();
+
             foreach (var item in items)
             {
-                string exeName = "";
-                try { exeName = System.IO.Path.GetFileNameWithoutExtension(item.Path).ToLower(); } catch { }
-                foreach (var w in windows)
+                var hwnds = WindowEngine.FindWindowsForTool(item);
+                foreach (var h in hwnds)
                 {
-                    if (!string.IsNullOrEmpty(exeName) && w.ProcessName.ToLower().Contains(exeName))
+                    if (!usedHwnds.Contains(h))
                     {
-                        WindowEngine.ApplyLayout(w.Handle, item);
+                        usedHwnds.Add(h);
+                        item.LastHwnd = h;
+                        WindowEngine.ApplyLayout(h, item);
                         matched++;
                         break;
                     }
@@ -2283,36 +2394,35 @@ namespace WorkspaceHubApp
             var items = profile.Items.FindAll(x => x.Enabled);
             if (items.Count == 0) return;
 
-            var windows = WindowEngine.GetOpenWindows();
-            var matchedWindows = new List<Tuple<WindowEngine.OpenWindowInfo, ToolItem>>();
+            // 1. 各ツールに対応するウィンドウをすべて収集（重複排除）
+            var toolWindowPairs = new List<Tuple<IntPtr, ToolItem>>();
+            var matchedHwnds = new HashSet<IntPtr>();
 
             foreach (var item in items)
             {
-                string exeName = "";
-                try { exeName = System.IO.Path.GetFileNameWithoutExtension(item.Path).ToLowerInvariant(); } catch { }
-                if (string.IsNullOrEmpty(exeName)) continue;
-
-                foreach (var w in windows)
+                var hwnds = WindowEngine.FindWindowsForTool(item);
+                foreach (var h in hwnds)
                 {
-                    if (w.ProcessName.ToLowerInvariant().Contains(exeName))
+                    if (!matchedHwnds.Contains(h))
                     {
-                        matchedWindows.Add(new Tuple<WindowEngine.OpenWindowInfo, ToolItem>(w, item));
-                        break;
+                        matchedHwnds.Add(h);
+                        item.LastHwnd = h;
+                        toolWindowPairs.Add(new Tuple<IntPtr, ToolItem>(h, item));
                     }
                 }
             }
 
-            if (matchedWindows.Count == 0)
+            if (toolWindowPairs.Count == 0)
             {
                 txtStatus.Text = "最小化/復元対象の実行中ツールが見つかりませんでした。";
                 return;
             }
 
-            // 1つでも通常状態のウィンドウがあれば一括最小化、すべて最小化されていれば復元
+            // 2. 状態判定: 1つでも通常表示（非最小化）のウィンドウがあれば「最小化モード」、すべて最小化なら「復元モード」
             bool anyVisible = false;
-            foreach (var m in matchedWindows)
+            foreach (var pair in toolWindowPairs)
             {
-                if (!WindowEngine.IsIconic(m.Item1.Handle))
+                if (!WindowEngine.IsIconic(pair.Item1))
                 {
                     anyVisible = true;
                     break;
@@ -2321,19 +2431,28 @@ namespace WorkspaceHubApp
 
             if (anyVisible)
             {
-                foreach (var m in matchedWindows)
+                // 一括最小化
+                foreach (var pair in toolWindowPairs)
                 {
-                    WindowEngine.ShowWindow(m.Item1.Handle, WindowEngine.SW_MINIMIZE);
+                    IntPtr h = pair.Item1;
+                    WindowEngine.ShowWindow(h, WindowEngine.SW_MINIMIZE);
+                    WindowEngine.PostMessage(h, WindowEngine.WM_SYSCOMMAND, (IntPtr)WindowEngine.SC_MINIMIZE, IntPtr.Zero);
                 }
-                txtStatus.Text = "🧹 ツールを一括最小化しました (" + matchedWindows.Count + " 件)";
+                txtStatus.Text = "🧹 ツールを一括最小化しました (" + toolWindowPairs.Count + " 件)";
             }
             else
             {
-                foreach (var m in matchedWindows)
+                // 一括復元＆レイアウト再適用
+                foreach (var pair in toolWindowPairs)
                 {
-                    WindowEngine.ApplyLayout(m.Item1.Handle, m.Item2);
+                    IntPtr h = pair.Item1;
+                    ToolItem item = pair.Item2;
+                    WindowEngine.ShowWindow(h, WindowEngine.SW_RESTORE);
+                    WindowEngine.PostMessage(h, WindowEngine.WM_SYSCOMMAND, (IntPtr)WindowEngine.SC_RESTORE, IntPtr.Zero);
+                    Thread.Sleep(30);
+                    WindowEngine.ApplyLayout(h, item);
                 }
-                txtStatus.Text = "✨ ツールを一括復元・整列しました (" + matchedWindows.Count + " 件)";
+                txtStatus.Text = "✨ ツールを一括復元・整列しました (" + toolWindowPairs.Count + " 件)";
             }
         }
 
@@ -2351,27 +2470,21 @@ namespace WorkspaceHubApp
 
             if (res != MessageBoxResult.Yes) return;
 
-            var windows = WindowEngine.GetOpenWindows();
-            int closedCount = 0;
-
+            var closedHwnds = new HashSet<IntPtr>();
             foreach (var item in items)
             {
-                string exeName = "";
-                try { exeName = System.IO.Path.GetFileNameWithoutExtension(item.Path).ToLowerInvariant(); } catch { }
-                if (string.IsNullOrEmpty(exeName)) continue;
-
-                foreach (var w in windows)
+                var hwnds = WindowEngine.FindWindowsForTool(item);
+                foreach (var h in hwnds)
                 {
-                    if (w.ProcessName.ToLowerInvariant().Contains(exeName))
+                    if (!closedHwnds.Contains(h))
                     {
-                        WindowEngine.PostMessage(w.Handle, WindowEngine.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-                        closedCount++;
-                        break;
+                        closedHwnds.Add(h);
+                        WindowEngine.PostMessage(h, WindowEngine.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
                     }
                 }
             }
 
-            txtStatus.Text = "❌ ツールに終了リクエストを送信しました (" + closedCount + " 件)";
+            txtStatus.Text = "❌ ツールに終了リクエストを送信しました (" + closedHwnds.Count + " 件)";
         }
 
         // ==========================================
